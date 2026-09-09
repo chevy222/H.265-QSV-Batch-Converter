@@ -1,45 +1,37 @@
 # H.265 QSV Batch Converter
 
-基于 **Intel Quick Sync（QSV）硬解硬编**的 Windows 批量转码脚本：把当前目录下所有 `*.mp4` 一键转为 H.265/HEVC，支持 90° 旋转、分辨率封顶、码率自适应和音频自动增益，解码→处理→编码全程帧不下显卡。
+基于 **Intel Quick Sync（QSV）**的 Windows 批量转码脚本：把当前目录下所有 `*.mp4` 一键转为 H.265/HEVC，支持 90° 旋转、分辨率封顶、码率自适应和音频自动增益，封面原样保留。
 
 典型场景：手机录像方向纠正、老视频统一压成 H.265 省空间、音量偏小的录像自动拉满到不削顶。
+
+> **编码器路线会自动协商**：脚本在第一个文件上依次尝试「全 GPU → QSV 硬解 + CPU 滤镜 → 纯软件」三条路线，成功后锁定，后续文件沿用。驱动/ffmpeg 组合不同也能跑通。
 
 ---
 
 ## 功能特性
 
-- **全硬件流水线**：`-hwaccel qsv` 解码 → `vpp_qsv`/`scale_qsv` 旋转缩放 → `hevc_qsv` 编码，帧始终留在 GPU，不回读内存
-- **批量处理**：自动遍历**当前目录**下所有 `*.mp4`，逐个转码并汇总 `OK / FAIL / SKIP`
-- **三种旋转模式**：顺时针 90°（默认）/ 逆时针 90° / 不旋转，支持交互提问或命令行参数
-- **码率自适应**：沿用源视频码率、5000 kbps 封顶，并设置 `maxrate = 1.2×`、`bufsize = 2×`
-- **分辨率封顶**：限制在 1920×1080 以内，保持宽高比、**不放大**、自动对齐为偶数尺寸
-- **音频自动增益**：先扫描音量峰值，放大到恰好不削顶（0 dBFS）；若本就接近满度则直接流复制、不重编码
-- **容错与续跑**：输出到桌面、同名文件自动跳过（不覆盖）；转码失败自动删除残缺文件
-- **ffmpeg 双路径查找**：优先脚本内置路径，找不到自动回退到 PATH 环境变量
+- **三级编码器路线自动降级**（详见[编码器路线](#编码器路线自动降级)）
+  - mode 1 全 GPU：QSV 解码 → `vpp_qsv`/`scale_qsv` → `hevc_qsv`
+  - mode 2 混合：QSV 解码 → `hwdownload` → CPU 旋转缩放 → `hevc_qsv`
+  - mode 3 软件：CPU 解码 → CPU 滤镜 → `libx265`
+- **批量处理**：遍历**当前目录**下所有 `*.mp4`，逐个转码并汇总 `OK / FAIL / SKIP`
+- **三种旋转模式**：顺时针 90°（默认）/ 逆时针 90° / 不旋转
+- **分辨率封顶与方向无关**：长边 ≤ `MAXW`、短边 ≤ `MAXH`，横屏竖屏源都不会被误缩小
+- **码率自适应**：沿用源码率、`BRCAP` 封顶，`maxrate = 1.2×`、`bufsize = 2×`
+- **音频自动增益**：扫描峰值后放大到 0 dBFS，上限 `MAXGAIN` dB；已接近满度则直接复制
+- **封面保留**：`attached_pic` 原样复制，**不参与旋转缩放**
+- **静默失败兜底**：退出码之外还校验输出文件大小，避免 `frame=0 / exit 0` 被误判为成功
+- **ffmpeg 双路径查找**：优先内置路径，缺失回退 PATH
 
 ## 环境要求
 
 | 项    | 要求                                                            |
 | ---- | ------------------------------------------------------------- |
 | 操作系统 | Windows（`.bat` / cmd 脚本，不依赖 PowerShell）                       |
-| 硬件   | 支持 Intel Quick Sync 的核显（需支持 HEVC 编码，Skylake 及以后的多数 iGPU），驱动正常 |
-| 软件   | ffmpeg、ffprobe（需包含 `hevc_qsv`，官方 full/essentials build 均可）    |
+| 硬件   | Intel 核显（可选，没有也能跑，会落到软件模式）                                   |
+| 软件   | ffmpeg、ffprobe（需包含 `hevc_qsv`；没有 QSV 时会自动用 `libx265`）         |
 
-> NVIDIA / AMD 独显无法直接使用本脚本（编码写死为 QSV），需自行替换为 `hevc_nvenc` / `hevc_amf`。
-
-## 安装 ffmpeg
-
-脚本按以下顺序查找 ffmpeg / ffprobe，**任一满足即可**：
-
-1. **内置路径**：`D:\software\ffmpeg\bin\ffmpeg.exe`（可修改脚本顶部变量 `FF` / `FP` 指向你自己的安装位置）；
-
-2. **PATH 环境变量**：内置路径不存在时，自动用 `where` 查找 PATH 上的 `ffmpeg` / `ffprobe`。例如用 winget 安装：
-   
-   ```bat
-   winget install Gyan.FFmpeg
-   ```
-
-两者都找不到时会打印 `[ERROR]` 并退出，不会继续空跑。
+> NVIDIA / AMD 独显可以跑 mode 2 / 3，想全 GPU 需自行换成 `hevc_nvenc` / `hevc_amf`。
 
 ## 使用方法
 
@@ -54,63 +46,109 @@ convert_h265.bat 1   REM 1 = 逆时针 90°
 convert_h265.bat 2   REM 2 = 不旋转（仅缩放/转码）
 ```
 
-运行后会先打印本次配置，例如：
+输出示例：
 
 ```text
 Source : D:\videos\
 FFmpeg : D:/software/ffmpeg/bin/ffmpeg.exe
-Output : C:\Users\you\Desktop
+Output : C:\Users\you\Desktop\H265
 Rotate : clockwise 90
-Audio  : auto max no-clip gain
+Cap    : long side 1920 / short side 1080, bitrate cap 5000k
+Audio  : auto max no-clip gain, ceiling 24 dB
+Cover  : 1 (1 = preserve attached_pic, never rotated)
 ----------------------------------------
 [CONV] "VID_0001.mp4" : bitrate 4200k (peak 5040k), rotate clockwise 90, audio +6.3dB @ 128k
-[OK] "VID_0001.mp4"
+[PROBE] testing encoder paths on the first file...
+[PROBE] mode 2 locked: hybrid (qsv decode, CPU filter, hevc_qsv)
+[OK] "VID_0001.mp4" (1478014 bytes)
 ----------------------------------------
-All done. OK=1  FAIL=0  SKIP=0
+All done. OK=1  FAIL=0  SKIP=0  (encoder mode 2)
 ```
 
-**输出位置**：`%USERPROFILE%\Desktop`（桌面），与源文件同名；桌面上已存在同名文件时直接 `[SKIP]`，可安全重复运行。
+**输出位置**：`%USERPROFILE%\Desktop\H265`（可用 `OUTDIR` 改）。与源文件同名；已存在则 `[SKIP]`，可安全重复运行。
+
+> 输出目录刻意与源目录分开。如果把输出直接放在桌面上，桌面上的任何同名文件都会让对应视频被静默跳过。
+
+## 编码器路线自动降级
+
+| 模式 | 链路 | 适用 |
+|---|---|---|
+| 1 全 GPU | `-hwaccel qsv -hwaccel_output_format qsv` → `vpp_qsv` → `hevc_qsv` | 驱动较新，QSV 滤镜可用 |
+| 2 混合 | `-hwaccel qsv` → `hwdownload,format=nv12` → CPU 滤镜 → `hevc_qsv` | QSV 滤镜不可用但 QSV 编码可用 |
+| 3 软件 | CPU 解码 → CPU 滤镜 → `libx265` | 无 Intel 核显 / QSV 完全不可用 |
+
+- 协商只在**第一个文件**上做，成功后锁定，后续文件直接用同一模式
+- 想跳过协商，把 CONFIG 里的 `FORCE_MODE` 设成 `1` / `2` / `3`
+- **为什么需要降级**：ffmpeg 9（2025-08 之后）与部分旧版 Intel 驱动 / oneVPL 运行时组合下，`vpp_qsv` 和 `scale_qsv` 会以 `Could not create the texture (80070057)` 失败，退出码 `-1313558101`。此时 QSV 硬解和硬编本身仍是好的，走 mode 2 只把滤镜挪到 CPU，速度依然远快于纯软件
+- **`-low_power 1`** 在同一批旧驱动上会让 `hevc_qsv` 报 `some encoding parameters are not supported by the QSV runtime`（退出码 `-40`）。它只用于 mode 1，出问题把 CONFIG 里的 `LOWPOWER` 改成 `0`
 
 ## 转码策略说明
 
 | 维度   | 策略                                                                   |
 | ---- | -------------------------------------------------------------------- |
-| 视频编码 | H.265/HEVC（`hevc_qsv`），`-low_power 1 -preset veryfast -extbrc 1`     |
-| 视频码率 | 依次探测：视频流码率 → 容器总码率 → 兜底 3500k；最终封顶 5000k；`maxrate=1.2×`、`bufsize=2×` |
-| 分辨率  | 不超过 1920×1080，保持比例、不放大、宽高取偶数                                         |
-| 旋转   | `vpp_qsv transpose` 在 GPU 上完成；默认顺时针 90°，可选逆时针或不转                     |
+| 视频编码 | H.265/HEVC（`hevc_qsv`），`-preset veryfast -extbrc 1`；软件模式 `libx265 -crf 23` |
+| 视频码率 | 视频流码率 → 容器码率 → 兜底 3500k 三级回退，最终封顶 `BRCAP`；`maxrate=1.2×`、`bufsize=2×` |
+| 分辨率   | 长边 ≤ 1920、短边 ≤ 1080，保持比例、不放大、宽高取偶数                             |
+| 旋转   | `transpose` 在 GPU（mode 1）或 CPU（mode 2/3）完成                        |
 | 帧率   | 保持源帧率，不重采样                                                           |
-| 音频增益 | `volumedetect` 扫描峰值 → 计算最大无削顶增益 → `volume` 滤镜放大到 0 dBFS              |
-| 音频编码 | 需要增益时转 AAC，码率取源音频码率并钳制在 64–192k（探测不到则 128k）；无需增益时 `-c:a copy` 直接复制   |
-| 封装   | MP4 + `+faststart`（moov 前置，便于网页/手机拖动播放）                              |
+| 音频增益 | `volumedetect` 扫描峰值 → 最大无削顶增益（上限 `MAXGAIN` dB）→ `volume` 滤镜          |
+| 音频编码 | 需要增益时转 AAC，码率取源音频码率并钳制在 64–192k；无需增益时 `-c:a copy`                    |
+| 封面   | 探测主视频流位置（封面可能在 `v:0`），只对该流做滤镜，封面 `-c copy` 保留                     |
+| 封装   | MP4 + `+faststart` + `hvc1` tag（Apple 设备可播）                        |
 
-## 处理流程（每个文件）
+## 自定义（脚本顶部 CONFIG）
 
-1. 桌面已有同名输出 → 跳过；
-2. ffprobe 探测视频码率（三级回退）并计算目标码率、峰值码率与缓冲区；
-3. ffmpeg `volumedetect` 扫描音频峰值，计算增益量与音频码率；
-4. 全 QSV 流水线一次完成旋转/缩放 + H.265 编码 + 音频处理；
-5. 校验退出码：失败则删除残缺输出并计入 FAIL，成功计入 OK。
+```bat
+set "OUTDIR=%USERPROFILE%\Desktop\H265"   REM 输出目录（不要和源目录相同）
+set "MAXW=1920"                           REM 长边上限
+set "MAXH=1080"                           REM 短边上限
+set "BRCAP=5000"                          REM 视频码率封顶 kbps
+set "BRDEFAULT=3500"                      REM 探测不到码率时的兜底值
+set "MAXGAIN=24"                          REM 音频增益上限 dB
+set "CRF=23"                              REM 软件模式 libx265 质量
+set "LOWPOWER=1"                          REM mode 1 是否用 -low_power 1
+set "ASK=1"                               REM 0 = 不提问（计划任务/管道场景）
+set "KEEPCOVER=1"                         REM 0 = 丢弃封面
+set "FORCE_MODE="                         REM 留空自动协商，或写死 1/2/3
+```
 
 ## 已知限制与踩坑记录
 
-- **源编码限制**：QSV 硬解仅保证 H.264 / HEVC 输入；MPEG-4 等编码可能出现 `frame=0` 却返回退出码 0 的**静默假成功**（没有输出文件却看似成功），使用前请确认源是 H.264/HEVC。
-- **刻意不启用 `-look_ahead_depth`**：在部分 QSV 驱动上会触发 `Invalid FrameType:0`（退出码 183），故脚本中省略该参数。
-- **仅处理当前目录一层**的 `*.mp4`：不递归子目录，也不匹配 `.mov`/`.mkv` 等其他容器（可自行修改 `for` 行的通配符）。
-- 输出目录固定为桌面，可修改脚本顶部 `OUTDIR` 变量。
-- 每个文件需要先跑一遍音频峰值扫描（一次快速空解码），超大批量时会多花一些时间。
+### 分辨率表达式为什么用 `max()` / `min()`
 
-## 自定义（脚本顶部变量）
+`vpp_qsv` 是**先按 `w`/`h` 缩放、再执行 `transpose`**，所以表达式里的 `iw`/`ih` 是旋转**前**的尺寸，最终输出为 `(h, w)`。
+
+早期版本写死 `min(1,min(1080/ih,1920/iw))`，等价于「把原始帧塞进 1920×1080 横屏框再旋转」：
+
+| 源 | 旧表达式 | 现表达式 |
+|---|---|---|
+| 横屏 1920×1080 | 1080×1920 ✓ | 1080×1920 ✓ |
+| **竖屏 1080×1920** | **1080×606**（只剩 31% 像素）✗ | 1920×1080 ✓ |
+| 4K 横屏 3840×2160 | 1080×1920 ✓ | 1080×1920 ✓ |
+
+改成方向无关的长短边约束后横竖都正确：
 
 ```bat
-set "FF=D:/software/ffmpeg/bin/ffmpeg.exe"   REM ffmpeg 首选路径，缺失回退 PATH
-set "FP=D:/software/ffmpeg/bin/ffprobe.exe"  REM ffprobe 首选路径
-set "OUTDIR=%USERPROFILE%\Desktop"           REM 输出目录
+set "SC=min(1,min(%MAXW%/max(iw,ih),%MAXH%/min(iw,ih)))"
 ```
 
+不旋转模式（`ROT=2`）同理：旧表达式把横屏源塞进竖屏框，1280×720 会被压到 1080×606，现在保持 1280×720。
+
+### cmd 的两个坑（改这个脚本务必先看）
+
+1. **`%ERRORLEVEL%` 和 `if errorlevel` 不能在括号块里读**。cmd 解析 `if (...)` 块时会一次性展开所有 `%VAR%`，块内读到的永远是进入块之前的旧值。脚本里所有退出码判断都放在块外。
+2. **`if errorlevel 1` 的含义是「≥ 1」，读不到负的退出码**。ffmpeg 在 QSV 滤镜失败时返回 `-1313558101`，用 `if errorlevel 1` 判断会被当成成功。脚本统一用文本比较 `if not "%ERRORLEVEL%"=="0"`。
+
+### 其它
+
+- **`find` 不能用来抓 `volumedetect` 输出**：Git Bash / Cygwin / MSYS2 放进 PATH 后，它们的 `find` 会抢先。脚本用 `findstr`。
+- **`-noautorotate`**：ffmpeg 5.1+ 会按旋转元数据自动插 `transpose`，软解路径会生效、QSV 硬解路径当前不生效——这是版本相关行为，脚本显式关掉，避免手机竖拍视频被双重旋转。
+- **`set /p` 在非交互 stdin 下会永久挂死**（计划任务、管道、部分 CI）。这类场景请传参数（`convert_h265.bat 1`）或设 `ASK=0`。
+- **每个文件要多跑一遍音频峰值扫描**（一次纯音频空解码），超大批量时会多花时间。
+- **仅处理当前目录一层**的 `*.mp4`，不递归，也不匹配 `.mov`/`.mkv`（可自行改 `for` 行的通配符）。
+- 临时文件在 `%TEMP%` 且带 `%RANDOM%` 后缀，多开实例不会互相踩。
+
 ## License
-
-
 
 ```text
 MIT License

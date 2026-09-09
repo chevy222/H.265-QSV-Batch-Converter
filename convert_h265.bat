@@ -1,36 +1,87 @@
 @echo off
 rem =====================================================
 rem Batch convert all *.mp4 in the CURRENT directory (where you run it from):
-rem   rotate + H.265 (Intel QSV) -> Desktop, same filename
-rem   video bitrate = source bitrate, capped at 5000 kbps, fps kept
-rem   audio: auto gain to full scale, max amplification without clipping
-rem   audio bitrate = source audio bitrate, clamped to 64-192k
-rem   rotation: arg/prompt 1 = counter-clockwise 90 deg, 2 = no rotation, default = clockwise 90 deg
+rem   rotate + H.265 (Intel QSV) -> output dir, same filename
+rem   video bitrate = source bitrate, capped at BRCAP kbps
+rem   audio: auto gain to full scale, capped at MAXGAIN dB, no clipping
+rem   cover art (attached_pic) is copied through untouched, never rotated
+rem   rotation: arg/prompt 1 = counter-clockwise 90, 2 = none, default = clockwise 90
+rem
+rem Encoder path is negotiated once on the first file, then locked in:
+rem   MODE 1  full GPU : qsv decode -> vpp_qsv / scale_qsv -> hevc_qsv   (fastest)
+rem   MODE 2  hybrid   : qsv decode -> hwdownload -> CPU filter -> hevc_qsv
+rem   MODE 3  software : CPU decode -> CPU filter -> libx265             (always works)
+rem Some ffmpeg 9 + older Intel driver combos cannot create the QSV textures
+rem that vpp_qsv / scale_qsv need; those machines fall through to mode 2 or 3
+rem automatically. Set FORCE_MODE to skip the negotiation.
+rem
+rem IMPORTANT for maintenance - two cmd traps bite here:
+rem  1. every errorlevel test is kept OUTSIDE parentheses. cmd resolves
+rem     %ERRORLEVEL% and `if errorlevel` when it parses a bracketed block, so
+rem     testing them inside ( ) silently reports a stale value.
+rem  2. `if errorlevel 1` means ">= 1". ffmpeg can exit with a LARGE NEGATIVE
+rem     code (-1313558101 for the QSV texture failure), which reads as success.
+rem     Always compare as text: if not "%ERRORLEVEL%"=="0"
 rem =====================================================
-setlocal
-rem preferred location; if not found there, falls back to ffmpeg/ffprobe on PATH (see checks below)
+setlocal EnableExtensions
+rem preferred location; if not found there, falls back to ffmpeg/ffprobe on PATH
 set "FF=D:/software/ffmpeg/bin/ffmpeg.exe"
 set "FP=D:/software/ffmpeg/bin/ffprobe.exe"
-set "OUTDIR=%USERPROFILE%\Desktop"
-set "BRFILE=%TEMP%\h265_br.txt"
-set "VOLFILE=%TEMP%\h265_vol.txt"
-set "ABRFILE=%TEMP%\h265_abr.txt"
+
+rem ---------------- CONFIG ----------------
+rem Output directory. Kept separate from the source dir on purpose: any stray
+rem same-named file in the output dir would otherwise silently skip the video.
+set "OUTDIR=%USERPROFILE%\Desktop\H265"
+rem Resolution cap. max()/min() makes it orientation independent: the LONG side
+rem is capped at MAXW and the SHORT side at MAXH, whichever way the source is.
+set "MAXW=1920"
+set "MAXH=1080"
+rem Video bitrate cap in kbps
+set "BRCAP=5000"
+rem Fallback bitrate in kbps when the source bitrate cannot be probed
+set "BRDEFAULT=3500"
+rem Audio gain ceiling in dB. A near-silent source would otherwise be amplified
+rem by 50-90 dB and its noise floor would end up at full scale.
+set "MAXGAIN=24"
+rem Software fallback quality (libx265 CRF, lower = better / bigger)
+set "CRF=23"
+rem -low_power 1 for the full-GPU path. Some older Intel drivers reject it with
+rem "some encoding parameters are not supported by the QSV runtime"; set to 0 then.
+set "LOWPOWER=1"
+rem 1 = ask for the rotation mode when no argument is given.
+rem set /p blocks forever on a non-interactive stdin (scheduled task, pipe, some
+rem CI runners). Set ASK=0 - or always pass the mode as %1 - in those cases.
+set "ASK=1"
+rem 1 = keep the source cover art as attached_pic
+set "KEEPCOVER=1"
+rem Leave empty to auto-negotiate, or pin to 1 / 2 / 3
+set "FORCE_MODE="
+rem ----------------------------------------
+
+rem unique suffix so two instances running at once do not clobber each other
+set "RND=%RANDOM%"
+set "BRFILE=%TEMP%\h265_br_%RND%.txt"
+set "VOLFILE=%TEMP%\h265_vol_%RND%.txt"
+set "ABRFILE=%TEMP%\h265_abr_%RND%.txt"
+set "V0FILE=%TEMP%\h265_v0_%RND%.txt"
 set "OKCNT=0"
 set "FAILCNT=0"
 set "SKIPCNT=0"
+rem negotiated encoder mode: empty = not probed yet, then 1 / 2 / 3
+set "VMODE=%FORCE_MODE%"
 
 rem --- prefer hardcoded path; only when missing there, fall back to ffmpeg/ffprobe on PATH
 if exist "%FF%" if exist "%FP%" goto :tools_ok
 where ffmpeg >nul 2>nul
-if errorlevel 1 (
+if not "%ERRORLEVEL%"=="0" (
     echo [ERROR] ffmpeg not found: neither "%FF%" nor on PATH
-    pause
+    if "%ASK%"=="1" pause
     exit /b 1
 )
 where ffprobe >nul 2>nul
-if errorlevel 1 (
+if not "%ERRORLEVEL%"=="0" (
     echo [ERROR] ffprobe not found: neither "%FP%" nor on PATH
-    pause
+    if "%ASK%"=="1" pause
     exit /b 1
 )
 set "FF=ffmpeg"
@@ -38,46 +89,122 @@ set "FP=ffprobe"
 echo [INFO] hardcoded path missing, using ffmpeg/ffprobe from PATH
 :tools_ok
 
+rem --- refuse to run when the output dir is the source dir (would mass-SKIP)
+for %%d in ("%OUTDIR%") do set "OUTDIR_FULL=%%~fd"
+if /i "%CD%"=="%OUTDIR_FULL%" (
+    echo [ERROR] source directory and output directory are the same: "%CD%"
+    echo         every file would be skipped as "already converted".
+    echo         Change OUTDIR or run the script from another folder.
+    if "%ASK%"=="1" pause
+    exit /b 1
+)
+if not exist "%OUTDIR%" md "%OUTDIR%"
+if not "%ERRORLEVEL%"=="0" (
+    echo [ERROR] cannot create output directory "%OUTDIR%"
+    if "%ASK%"=="1" pause
+    exit /b 1
+)
+
 rem --- rotation mode: 1 = counter-clockwise 90, 2 = none, default (Enter) = clockwise 90
 set "ROT=%~1"
+if not defined ROT if "%ASK%"=="0" set "ROT=0"
 if not defined ROT set /p "ROT=Rotation: 1=counter-clockwise 90, 2=no rotation, Enter=clockwise 90 : "
 if not defined ROT set "ROT=0"
 if not "%ROT%"=="1" if not "%ROT%"=="2" if not "%ROT%"=="0" (
     echo [ERROR] invalid rotation "%ROT%" ^(expected 1 / 2 or Enter^)
-    pause
+    if "%ASK%"=="1" pause
     exit /b 1
 )
-set "VF=vpp_qsv=transpose=clock:w='floor(iw*min(1,min(1080/ih,1920/iw))/2)*2':h='floor(ih*min(1,min(1080/ih,1920/iw))/2)*2'"
+
+rem --- scale factor: long side <= MAXW, short side <= MAXH, never upscale.
+rem max()/min() keeps this correct for portrait AND landscape sources, for both
+rem the vpp_qsv path (scales first, then transposes) and the CPU path
+rem (transposes first, then scales).
+set "SC=min(1,min(%MAXW%/max(iw,ih),%MAXH%/min(iw,ih)))"
+set "WSC=floor(iw*%SC%/2)*2"
+set "HSC=floor(ih*%SC%/2)*2"
+
 set "ROTTXT=clockwise 90"
-if "%ROT%"=="1" set "VF=vpp_qsv=transpose=cclock:w='floor(iw*min(1,min(1080/ih,1920/iw))/2)*2':h='floor(ih*min(1,min(1080/ih,1920/iw))/2)*2'"
+set "ROTQSV=clock"
+set "ROTCPU=transpose=clock,"
 if "%ROT%"=="1" set "ROTTXT=counter-clockwise 90"
-if "%ROT%"=="2" set "VF=scale_qsv=w='floor(iw*min(1,min(1080/iw,1920/ih))/2)*2':h='floor(ih*min(1,min(1080/iw,1920/ih))/2)*2'"
+if "%ROT%"=="1" set "ROTQSV=cclock"
+if "%ROT%"=="1" set "ROTCPU=transpose=cclock,"
 if "%ROT%"=="2" set "ROTTXT=none"
+if "%ROT%"=="2" set "ROTQSV="
+if "%ROT%"=="2" set "ROTCPU="
+
+rem MODE 1 filters run on the GPU
+if "%ROT%"=="2" (
+    set "VF1=scale_qsv=w='%WSC%':h='%HSC%'"
+) else (
+    set "VF1=vpp_qsv=transpose=%ROTQSV%:w='%WSC%':h='%HSC%'"
+)
+rem MODE 2 / 3 filters run on the CPU (MODE 2 prepends hwdownload,format=nv12)
+set "VFCPU=%ROTCPU%scale='%WSC%':'%HSC%'"
+
+rem --- nothing to do?
+set "TOTAL=0"
+for %%f in ("%CD%\*.mp4") do set /a TOTAL+=1
+if "%TOTAL%"=="0" (
+    echo [WARN] no *.mp4 files found in "%CD%\"
+    goto :summary
+)
 
 echo Source : %CD%\
 echo FFmpeg : %FF%
 echo Output : %OUTDIR%
 echo Rotate : %ROTTXT%
-echo Audio  : auto max no-clip gain
+echo Cap    : long side %MAXW% / short side %MAXH%, bitrate cap %BRCAP%k
+echo Audio  : auto max no-clip gain, ceiling %MAXGAIN% dB
+echo Cover  : %KEEPCOVER% ^(1 = preserve attached_pic, never rotated^)
 echo ----------------------------------------
 for %%f in ("%CD%\*.mp4") do call :process "%%~ff"
 
+:summary
 echo.
 echo ----------------------------------------
-echo All done. OK=%OKCNT%  FAIL=%FAILCNT%  SKIP=%SKIPCNT%
-del "%BRFILE%" "%VOLFILE%" "%ABRFILE%" 2>nul
+if defined VMODE (set "MODEDISP=%VMODE%") else (set "MODEDISP=-")
+echo All done. OK=%OKCNT%  FAIL=%FAILCNT%  SKIP=%SKIPCNT%  ^(encoder mode %MODEDISP%^)
+del "%BRFILE%" "%VOLFILE%" "%ABRFILE%" "%V0FILE%" 2>nul
+rem only hold the window open when running interactively (ASK=0 = unattended)
+if "%ASK%"=="1" pause
 exit /b 0
 
+rem ===================================================================
+rem  negotiate the encoder path once, on the first file
+rem ===================================================================
+:probe
+echo [PROBE] testing encoder paths on the first file...
+call :enc1
+if "%ERRORLEVEL%"=="0" goto :probe1
+call :enc2
+if "%ERRORLEVEL%"=="0" goto :probe2
+set "VMODE=3"
+echo [PROBE] mode 3 locked: software ^(CPU decode, CPU filter, libx265^)
+goto :eof
+:probe1
+set "VMODE=1"
+echo [PROBE] mode 1 locked: full GPU ^(qsv decode, vpp_qsv, hevc_qsv^)
+goto :eof
+:probe2
+set "VMODE=2"
+echo [PROBE] mode 2 locked: hybrid ^(qsv decode, CPU filter, hevc_qsv^)
+goto :eof
+
+rem ===================================================================
+rem  process one file
+rem ===================================================================
 :process
 set "IN=%~1"
 set "NAME=%~nx1"
 if exist "%OUTDIR%\%NAME%" (
-    echo [SKIP] "%NAME%" ^(already on Desktop^)
+    echo [SKIP] "%NAME%" ^(already in output dir^)
     set /a SKIPCNT+=1
     goto :eof
 )
 
-rem --- probe video stream bitrate, fallback to container bitrate, then 3500k
+rem --- probe video stream bitrate, fallback to container bitrate, then default
 set "BR="
 "%FP%" -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "%IN%" > "%BRFILE%" 2>nul
 set /p BR=<"%BRFILE%"
@@ -88,29 +215,54 @@ goto :havebr
 set "BR="
 "%FP%" -v error -show_entries format=bit_rate -of csv=p=0 "%IN%" > "%BRFILE%" 2>nul
 set /p BR=<"%BRFILE%"
-if not defined BR set "BR=3500000" & echo [WARN] "%NAME%" : bitrate unknown, use 3500k
-if "%BR%"=="N/A" set "BR=3500000" & echo [WARN] "%NAME%" : bitrate unknown, use 3500k
+if not defined BR set "BR=%BRDEFAULT%000" & echo [WARN] "%NAME%" : bitrate unknown, use %BRDEFAULT%k
+if "%BR%"=="N/A" set "BR=%BRDEFAULT%000" & echo [WARN] "%NAME%" : bitrate unknown, use %BRDEFAULT%k
 :havebr
 set /a KB=%BR%/1000
-if %KB% GTR 5000 (
-    set /a KB=5000
-    echo [WARN] "%NAME%" : source %BR% bps ^> 5000k, capped
+if %KB% GTR %BRCAP% (
+    set /a KB=%BRCAP%
+    echo [WARN] "%NAME%" : source %BR% bps ^> %BRCAP%k, capped
 )
 set /a MAXKB=KB*12/10
 set /a BUFKB=KB*2
 
+rem --- locate the real video stream. Cover art can sit at v:0 (yt-dlp often
+rem writes it first) and must never be fed through the rotate/scale filter.
+set "MAINV=0"
+set "OTHERV=1"
+set "V0C="
+if "%KEEPCOVER%"=="1" (
+    "%FP%" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "%IN%" > "%V0FILE%" 2>nul
+    set /p V0C=<"%V0FILE%"
+)
+if /i "%V0C%"=="mjpeg" set "MAINV=1" & set "OTHERV=0"
+if /i "%V0C%"=="png"   set "MAINV=1" & set "OTHERV=0"
+if /i "%V0C%"=="bmp"   set "MAINV=1" & set "OTHERV=0"
+if /i "%V0C%"=="gif"   set "MAINV=1" & set "OTHERV=0"
+
 rem --- scan audio peak level, compute max no-clip gain (amplify to 0 dBFS)
-rem note: no -v error here on purpose, volumedetect prints at info level
-set "AUD=-c:a copy"
+rem note: no -v error here on purpose, volumedetect prints at info level.
+rem findstr (not find) because Git Bash / Cygwin put their own find on PATH.
+set "AUD=-c:a:0 copy"
 set "AUDTXT=copy"
 set "MAXVOL="
 set "GI=0"
-"%FF%" -hide_banner -nostats -nostdin -i "%IN%" -vn -af volumedetect -f null NUL 2>&1 | find "max_volume" > "%VOLFILE%"
+"%FF%" -hide_banner -nostats -nostdin -noautorotate -i "%IN%" -vn -af volumedetect -f null NUL 2>&1 | findstr /c:"max_volume" > "%VOLFILE%"
 for /f "usebackq tokens=5" %%a in ("%VOLFILE%") do set "MAXVOL=%%a"
 if not defined MAXVOL goto :haveaud
+rem A positive or zero peak means the source already clips; amplifying would only
+rem clip harder. This sign check must happen before the minus sign is stripped.
+if not "%MAXVOL:~0,1%"=="-" (
+    echo [WARN] "%NAME%" : peak %MAXVOL% dB, already at or over full scale, audio copied
+    goto :haveaud
+)
 set "GAIN=%MAXVOL:-=%"
 for /f "delims=." %%i in ("%GAIN%") do set "GI=%%i"
 if "%GI%"=="0" goto :haveaud
+if %GI% GTR %MAXGAIN% (
+    set "GAIN=%MAXGAIN%"
+    echo [WARN] "%NAME%" : peak %MAXVOL% dB needs more than %MAXGAIN% dB, gain capped
+)
 
 rem --- audio bitrate = source audio bitrate, clamped to 64-192k
 set "ABR="
@@ -121,21 +273,76 @@ if "%ABR%"=="N/A" set "ABR=128000"
 set /a ABK=%ABR%/1000
 if %ABK% LSS 64 set /a ABK=64
 if %ABK% GTR 192 set /a ABK=192
-set "AUD=-af volume=%GAIN%dB -c:a aac -b:a %ABK%k"
+set "AUD=-af volume=%GAIN%dB -c:a:0 aac -b:a %ABK%k"
 set "AUDTXT=+%GAIN%dB @ %ABK%k"
 :haveaud
 echo [CONV] "%NAME%" : bitrate %KB%k ^(peak %MAXKB%k^), rotate %ROTTXT%, audio %AUDTXT%
 
-rem --- full QSV pipeline: hw decode (hwaccel qsv + hwaccel_output_format qsv keep frames on GPU) + single-filter rotate+scale (aspect kept, no upscale, even dims) + H.265 QSV encode (low_power + veryfast ~1.8x speed, extended BRC), audio auto gain, fps kept, faststart
-rem --- NOTE: -look_ahead_depth intentionally omitted (causes "Invalid FrameType:0"/exit 183 on this QSV driver). Source must be h264/hevc; MPEG4 etc. will fail silently (frame=0, exit 0).
-"%FF%" -v error -stats -nostdin -y -hwaccel qsv -hwaccel_output_format qsv -i "%IN%" -vf "%VF%" -c:v hevc_qsv -low_power 1 -preset veryfast -extbrc 1 -b:v %KB%k -maxrate %MAXKB%k -bufsize %BUFKB%k %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
-set "RC=%ERRORLEVEL%"
+set "LPOPT="
+if "%LOWPOWER%"=="1" set "LPOPT=-low_power 1"
+if "%KEEPCOVER%"=="1" (
+    set "MAPS=-map 0:v:%MAINV% -map 0:v:%OTHERV%? -map 0:a:0?"
+    set "COVER=-c:v:1 copy -disposition:v:1 attached_pic"
+) else (
+    set "MAPS=-map 0:v:%MAINV% -map 0:a:0?"
+    set "COVER="
+)
+
+if not defined VMODE call :probe
+if "%VMODE%"=="1" call :enc1
+if "%VMODE%"=="2" call :enc2
+if "%VMODE%"=="3" call :enc3
+if not "%ERRORLEVEL%"=="0" (set "RC=1") else (set "RC=0")
+
+rem guard against the silent "frame=0 but exit 0" case: a failed run can still
+rem leave an empty or truncated file, so check the size, not just ERRORLEVEL
+set "OSIZE=0"
+if exist "%OUTDIR%\%NAME%" for %%A in ("%OUTDIR%\%NAME%") do set "OSIZE=%%~zA"
+if "%RC%"=="0" if %OSIZE% LSS 1024 (
+    echo [FAIL] "%NAME%" ^(output is only %OSIZE% bytes, encoder reported success^)
+    set "RC=1"
+)
 if not "%RC%"=="0" (
     echo [FAIL] "%NAME%" ^(exit code %RC%^)
     if exist "%OUTDIR%\%NAME%" del "%OUTDIR%\%NAME%"
     set /a FAILCNT+=1
 ) else (
-    echo [OK] "%NAME%"
+    echo [OK] "%NAME%" ^(%OSIZE% bytes^)
     set /a OKCNT+=1
 )
 goto :eof
+
+rem ===================================================================
+rem  enc1 / enc2 / enc3 - one ffmpeg call each, exit code left in ERRORLEVEL
+rem  %MAPS% %COVER% %LPOPT% must already be set (done in :process)
+rem ===================================================================
+:enc1
+rem full GPU: qsv decode -> vpp_qsv / scale_qsv -> hevc_qsv
+"%FF%" -v error -stats -nostdin -y -noautorotate -hwaccel qsv -hwaccel_output_format qsv -i "%IN%" ^
+    %MAPS% -filter:v:0 "%VF1%" ^
+    -c:v:0 hevc_qsv %LPOPT% -preset veryfast -extbrc 1 ^
+    -b:v %KB%k -maxrate %MAXKB%k -bufsize %BUFKB%k -tag:v:0 hvc1 ^
+    %COVER% %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
+if not "%ERRORLEVEL%"=="0" exit /b 1
+exit /b 0
+
+:enc2
+rem hybrid: qsv decode -> hwdownload -> CPU filter -> hevc_qsv
+rem -hwaccel qsv hands QSV frames to the filter graph even without
+rem -hwaccel_output_format qsv, so hwdownload is mandatory before CPU filters.
+"%FF%" -v error -stats -nostdin -y -noautorotate -hwaccel qsv -i "%IN%" ^
+    %MAPS% -filter:v:0 "hwdownload,format=nv12,%VFCPU%" ^
+    -c:v:0 hevc_qsv -preset veryfast -extbrc 1 ^
+    -b:v %KB%k -maxrate %MAXKB%k -bufsize %BUFKB%k -tag:v:0 hvc1 ^
+    %COVER% %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
+if not "%ERRORLEVEL%"=="0" exit /b 1
+exit /b 0
+
+:enc3
+rem software fallback: CPU decode -> CPU filter -> libx265
+"%FF%" -v error -stats -nostdin -y -noautorotate -i "%IN%" ^
+    %MAPS% -filter:v:0 "%VFCPU%" ^
+    -c:v:0 libx265 -crf %CRF% -preset medium -tag:v:0 hvc1 ^
+    %COVER% %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
+if not "%ERRORLEVEL%"=="0" exit /b 1
+exit /b 0
