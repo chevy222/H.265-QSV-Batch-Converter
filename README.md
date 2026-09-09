@@ -19,7 +19,7 @@
 - **分辨率封顶与方向无关**：长边 ≤ `MAXW`、短边 ≤ `MAXH`，横屏竖屏源都不会被误缩小
 - **码率自适应**：沿用源码率、`BRCAP` 封顶，`maxrate = 1.2×`、`bufsize = 2×`
 - **音频自动增益**：扫描峰值后放大到 0 dBFS，上限 `MAXGAIN` dB；已接近满度则直接复制
-- **封面保留**：`attached_pic` 原样复制，**不参与旋转缩放**
+- **封面跟随旋转**：转码含旋转时，封面与画面同步旋转/缩放（重编码为高质量 mjpeg）；不旋转时原样复制
 - **静默失败兜底**：退出码之外还校验输出文件大小，避免 `frame=0 / exit 0` 被误判为成功
 - **ffmpeg 双路径查找**：优先内置路径，缺失回退 PATH
 
@@ -55,10 +55,10 @@ Output : C:\Users\you\Desktop\H265
 Rotate : clockwise 90
 Cap    : long side 1920 / short side 1080, bitrate cap 5000k
 Audio  : auto max no-clip gain, ceiling 24 dB
-Cover  : 1 (1 = preserve attached_pic, never rotated)
+Cover  : 1 (1 = keep attached_pic, rotated with the video)
 ----------------------------------------
 [CONV] "VID_0001.mp4" : bitrate 4200k (peak 5040k), rotate clockwise 90, audio +6.3dB @ 128k
-[PROBE] testing encoder paths on the first file...
+[PROBE] negotiating encoder path on the first file...
 [PROBE] mode 2 locked: hybrid (qsv decode, CPU filter, hevc_qsv)
 [OK] "VID_0001.mp4" (1478014 bytes)
 ----------------------------------------
@@ -93,7 +93,7 @@ All done. OK=1  FAIL=0  SKIP=0  (encoder mode 2)
 | 帧率   | 保持源帧率，不重采样                                                           |
 | 音频增益 | `volumedetect` 扫描峰值 → 最大无削顶增益（上限 `MAXGAIN` dB）→ `volume` 滤镜          |
 | 音频编码 | 需要增益时转 AAC，码率取源音频码率并钳制在 64–192k；无需增益时 `-c:a copy`                    |
-| 封面   | 始终探测 v:0 是否封面（`KEEPCOVER=0` 时也探测，否则封面在前的文件会把封面当主视频流编码、真视频被丢掉），滤镜只作用于真实视频流；`KEEPCOVER=1` 时封面 `-c copy` 保留，`=0` 时丢弃封面流                     |
+| 封面   | 始终探测 v:0 是否封面（`KEEPCOVER=0` 时也探测，否则封面在前的文件会把封面当主视频流编码、真视频被丢掉）。`KEEPCOVER=1` 时：含旋转则封面挂与画面相同的 `transpose+scale` 滤镜并重编码为 mjpeg（`-q 2`），方向/尺寸与画面一致；不旋转则 `-c copy` 原样保留。`=0` 时丢弃封面流                     |
 | 封装   | MP4 + `+faststart` + `hvc1` tag（Apple 设备可播）                        |
 
 ## 自定义（脚本顶部 CONFIG）
@@ -145,6 +145,8 @@ set "SC=min(1,min(%MAXW%/max(iw,ih),%MAXH%/min(iw,ih)))"
 - **`-noautorotate`**：ffmpeg 5.1+ 会按旋转元数据自动插 `transpose`，软解路径会生效、QSV 硬解路径当前不生效——这是版本相关行为，脚本显式关掉，避免手机竖拍视频被双重旋转。
 - **`set /p` 在非交互 stdin 下会永久挂死**（计划任务、管道、部分 CI）。这类场景请传参数（`convert_h265.bat 1`）或设 `ASK=0`。
 - **每个文件要多跑一遍音频峰值扫描**（一次纯音频空解码），超大批量时会多花时间。
+- **封面旋转为什么要用第二个输入**：`-hwaccel qsv` 会把封面（mjpeg/png）也硬解成 QSV 硬件帧，CPU 的 `transpose/scale` 滤镜无法消费（报 `Impossible to convert between the formats ... src: qsv`）；因此封面取自同一个文件的第二个**不带 hwaccel** 的软解输入，三种编码模式下行为一致。封面重编码为 mjpeg `-q 2`（接近视觉无损）。
+- ffmpeg 的 mp4 封装器会把 `attached_pic` 流写在文件末尾（音频之后），输出里封面流排在最后属正常现象。
 - **仅处理当前目录一层**的 `*.mp4`，不递归，也不匹配 `.mov`/`.mkv`（可自行改 `for` 行的通配符）。
 - 临时文件在 `%TEMP%` 且带 `%RANDOM%` 后缀，多开实例不会互相踩。
 

@@ -4,7 +4,8 @@ rem Batch convert all *.mp4 in the CURRENT directory (where you run it from):
 rem   rotate + H.265 (Intel QSV) -> output dir, same filename
 rem   video bitrate = source bitrate, capped at BRCAP kbps
 rem   audio: auto gain to full scale, capped at MAXGAIN dB, no clipping
-rem   cover art (attached_pic) is copied through untouched, never rotated
+rem   cover art (attached_pic) follows the video: rotated + scaled and
+rem   re-encoded as mjpeg when rotating, copied through untouched otherwise
 rem   rotation: arg/prompt 1 = counter-clockwise 90, 2 = none, default = clockwise 90
 rem
 rem Encoder path is negotiated once on the first file, then locked in:
@@ -162,7 +163,7 @@ echo Output : %OUTDIR%
 echo Rotate : %ROTTXT%
 echo Cap    : long side %MAXW% / short side %MAXH%, bitrate cap %BRCAP%k
 echo Audio  : auto max no-clip gain, ceiling %MAXGAIN% dB
-echo Cover  : %KEEPCOVER% ^(1 = preserve attached_pic, never rotated^)
+echo Cover  : %KEEPCOVER% ^(1 = keep attached_pic, rotated with the video^)
 echo ----------------------------------------
 for %%f in ("%CD%\*.mp4") do call :process "%%~ff"
 
@@ -229,7 +230,7 @@ goto :havebr
 set "BR="
 "%FP%" -v error -show_entries format=bit_rate -of csv=p=0 "%IN%" > "%BRFILE%" 2>nul
 set /p BR=<"%BRFILE%"
-if not defined BR set "BR=%BRDEFAULT%000" & echo [WARN] "%NAME%" : bitrate unknown, use %BRDEFAULT%k
+if not defined BR set "BR=N/A"
 if "%BR%"=="N/A" set "BR=%BRDEFAULT%000" & echo [WARN] "%NAME%" : bitrate unknown, use %BRDEFAULT%k
 :havebr
 set /a KB=%BR%/1000
@@ -294,18 +295,35 @@ echo [CONV] "%NAME%" : bitrate %KB%k ^(peak %MAXKB%k^), rotate %ROTTXT%, audio %
 
 set "LPOPT="
 if "%LOWPOWER%"=="1" set "LPOPT=-low_power 1"
+rem When rotating, the cover must follow the video. -hwaccel qsv hw-decodes
+rem the cover (mjpeg/png) into QSV frames that CPU filters cannot consume, so
+rem the cover is taken from a second software-only input (DIN) and re-encoded
+rem as high-quality mjpeg - a filtered stream cannot be stream-copied.
+set "DIN="
 if "%KEEPCOVER%"=="1" (
-    set "MAPS=-map 0:v:%MAINV% -map 0:v:%OTHERV%? -map 0:a:0?"
-    set "COVER=-c:v:1 copy -disposition:v:1 attached_pic"
+    if "%ROT%"=="2" (
+        set "MAPS=-map 0:v:%MAINV% -map 0:v:%OTHERV%? -map 0:a:0?"
+        set "COVER=-c:v:1 copy -disposition:v:1 attached_pic"
+    ) else (
+        set "MAPS=-map 0:v:%MAINV% -map 1:v:%OTHERV%? -map 0:a:0?"
+        set "COVER=-filter:v:1 %VFCPU% -c:v:1 mjpeg -q:v:1 2 -disposition:v:1 attached_pic"
+        set "DIN=-i "%IN%""
+    )
 ) else (
     set "MAPS=-map 0:v:%MAINV% -map 0:a:0?"
     set "COVER="
 )
 
-if not defined VMODE call :probe
-if "%VMODE%"=="1" call :enc1
-if "%VMODE%"=="2" call :enc2
-if "%VMODE%"=="3" call :enc3
+rem :probe already encodes the first file with the winning encN, so only
+rem dispatch when a mode is already locked. Nothing inside the parens reads
+rem ERRORLEVEL, per the trap note at the top of this file.
+if defined VMODE (
+    if "%VMODE%"=="1" call :enc1
+    if "%VMODE%"=="2" call :enc2
+    if "%VMODE%"=="3" call :enc3
+) else (
+    call :probe
+)
 if not "%ERRORLEVEL%"=="0" (set "RC=1") else (set "RC=0")
 
 rem guard against the silent "frame=0 but exit 0" case: a failed run can still
@@ -328,35 +346,32 @@ goto :eof
 
 rem ===================================================================
 rem  enc1 / enc2 / enc3 - one ffmpeg call each, exit code left in ERRORLEVEL
-rem  %MAPS% %COVER% %LPOPT% must already be set (done in :process)
+rem  %MAPS% %COVER% %DIN% %LPOPT% must already be set (done in :process)
 rem ===================================================================
 :enc1
 rem full GPU: qsv decode -> vpp_qsv / scale_qsv -> hevc_qsv
-"%FF%" -v error -stats -nostdin -y -noautorotate -hwaccel qsv -hwaccel_output_format qsv -i "%IN%" ^
+"%FF%" -v error -stats -nostdin -y -noautorotate -hwaccel qsv -hwaccel_output_format qsv -i "%IN%" %DIN% ^
     %MAPS% -filter:v:0 "%VF1%" ^
     -c:v:0 hevc_qsv %LPOPT% -preset veryfast -extbrc 1 ^
     -b:v %KB%k -maxrate %MAXKB%k -bufsize %BUFKB%k -tag:v:0 hvc1 ^
     %COVER% %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
-if not "%ERRORLEVEL%"=="0" exit /b 1
-exit /b 0
+exit /b
 
 :enc2
 rem hybrid: qsv decode -> hwdownload -> CPU filter -> hevc_qsv
 rem -hwaccel qsv hands QSV frames to the filter graph even without
 rem -hwaccel_output_format qsv, so hwdownload is mandatory before CPU filters.
-"%FF%" -v error -stats -nostdin -y -noautorotate -hwaccel qsv -i "%IN%" ^
+"%FF%" -v error -stats -nostdin -y -noautorotate -hwaccel qsv -i "%IN%" %DIN% ^
     %MAPS% -filter:v:0 "hwdownload,format=nv12,%VFCPU%" ^
     -c:v:0 hevc_qsv -preset veryfast -extbrc 1 ^
     -b:v %KB%k -maxrate %MAXKB%k -bufsize %BUFKB%k -tag:v:0 hvc1 ^
     %COVER% %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
-if not "%ERRORLEVEL%"=="0" exit /b 1
-exit /b 0
+exit /b
 
 :enc3
 rem software fallback: CPU decode -> CPU filter -> libx265
-"%FF%" -v error -stats -nostdin -y -noautorotate -i "%IN%" ^
+"%FF%" -v error -stats -nostdin -y -noautorotate -i "%IN%" %DIN% ^
     %MAPS% -filter:v:0 "%VFCPU%" ^
     -c:v:0 libx265 -crf %CRF% -preset medium -tag:v:0 hvc1 ^
     %COVER% %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
-if not "%ERRORLEVEL%"=="0" exit /b 1
-exit /b 0
+exit /b
