@@ -56,6 +56,11 @@ rem 1 = keep the source cover art as attached_pic
 set "KEEPCOVER=1"
 rem Leave empty to auto-negotiate, or pin to 1 / 2 / 3
 set "FORCE_MODE="
+if defined FORCE_MODE if not "%FORCE_MODE%"=="1" if not "%FORCE_MODE%"=="2" if not "%FORCE_MODE%"=="3" (
+    echo [ERROR] invalid FORCE_MODE "%FORCE_MODE%" ^(expected 1 / 2 / 3^)
+    if "%ASK%"=="1" pause
+    exit /b 1
+)
 rem ----------------------------------------
 
 rem unique suffix so two instances running at once do not clobber each other
@@ -172,25 +177,34 @@ if "%ASK%"=="1" pause
 exit /b 0
 
 rem ===================================================================
-rem  negotiate the encoder path once, on the first file
+rem  negotiate the encoder path on the first file, BY encoding it:
+rem  enc1/enc2/enc3 run with the full production arguments, so a
+rem  successful try IS file 1's real output - the first file is only
+rem  encoded once. A failed try leaves a stub that :process deletes.
+rem  The first path that succeeds is locked in for the whole batch.
 rem ===================================================================
 :probe
-echo [PROBE] testing encoder paths on the first file...
+echo [PROBE] negotiating encoder path on the first file...
 call :enc1
-if "%ERRORLEVEL%"=="0" goto :probe1
+if "%ERRORLEVEL%"=="0" (
+    set "VMODE=1"
+    echo [PROBE] mode 1 locked: full GPU ^(qsv decode, vpp_qsv, hevc_qsv^)
+    exit /b 0
+)
 call :enc2
-if "%ERRORLEVEL%"=="0" goto :probe2
-set "VMODE=3"
-echo [PROBE] mode 3 locked: software ^(CPU decode, CPU filter, libx265^)
-goto :eof
-:probe1
-set "VMODE=1"
-echo [PROBE] mode 1 locked: full GPU ^(qsv decode, vpp_qsv, hevc_qsv^)
-goto :eof
-:probe2
-set "VMODE=2"
-echo [PROBE] mode 2 locked: hybrid ^(qsv decode, CPU filter, hevc_qsv^)
-goto :eof
+if "%ERRORLEVEL%"=="0" (
+    set "VMODE=2"
+    echo [PROBE] mode 2 locked: hybrid ^(qsv decode, CPU filter, hevc_qsv^)
+    exit /b 0
+)
+call :enc3
+if "%ERRORLEVEL%"=="0" (
+    set "VMODE=3"
+    echo [PROBE] mode 3 locked: software ^(CPU decode, CPU filter, libx265^)
+    exit /b 0
+)
+echo [PROBE] all encoder paths failed on the first file
+exit /b 1
 
 rem ===================================================================
 rem  process one file
@@ -228,13 +242,13 @@ set /a BUFKB=KB*2
 
 rem --- locate the real video stream. Cover art can sit at v:0 (yt-dlp often
 rem writes it first) and must never be fed through the rotate/scale filter.
+rem Probed even when KEEPCOVER=0: the real stream must still be located, or a
+rem cover-first file would encode its cover as the only video stream.
 set "MAINV=0"
 set "OTHERV=1"
 set "V0C="
-if "%KEEPCOVER%"=="1" (
-    "%FP%" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "%IN%" > "%V0FILE%" 2>nul
-    set /p V0C=<"%V0FILE%"
-)
+"%FP%" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "%IN%" > "%V0FILE%" 2>nul
+set /p V0C=<"%V0FILE%"
 if /i "%V0C%"=="mjpeg" set "MAINV=1" & set "OTHERV=0"
 if /i "%V0C%"=="png"   set "MAINV=1" & set "OTHERV=0"
 if /i "%V0C%"=="bmp"   set "MAINV=1" & set "OTHERV=0"

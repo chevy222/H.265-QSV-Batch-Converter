@@ -93,7 +93,7 @@ All done. OK=1  FAIL=0  SKIP=0  (encoder mode 2)
 | 帧率   | 保持源帧率，不重采样                                                           |
 | 音频增益 | `volumedetect` 扫描峰值 → 最大无削顶增益（上限 `MAXGAIN` dB）→ `volume` 滤镜          |
 | 音频编码 | 需要增益时转 AAC，码率取源音频码率并钳制在 64–192k；无需增益时 `-c:a copy`                    |
-| 封面   | 探测主视频流位置（封面可能在 `v:0`），只对该流做滤镜，封面 `-c copy` 保留                     |
+| 封面   | 始终探测 v:0 是否封面（`KEEPCOVER=0` 时也探测，否则封面在前的文件会把封面当主视频流编码、真视频被丢掉），滤镜只作用于真实视频流；`KEEPCOVER=1` 时封面 `-c copy` 保留，`=0` 时丢弃封面流                     |
 | 封装   | MP4 + `+faststart` + `hvc1` tag（Apple 设备可播）                        |
 
 ## 自定义（脚本顶部 CONFIG）
