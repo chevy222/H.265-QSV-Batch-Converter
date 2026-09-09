@@ -165,7 +165,13 @@ echo Cap    : long side %MAXW% / short side %MAXH%, bitrate cap %BRCAP%k
 echo Audio  : auto max no-clip gain, ceiling %MAXGAIN% dB
 echo Cover  : %KEEPCOVER% ^(1 = keep attached_pic, rotated with the video^)
 echo ----------------------------------------
-for %%f in ("%CD%\*.mp4") do call :process "%%~ff"
+rem the path is passed to :process via the IN variable, NOT as a call
+rem argument: `call` re-parses its arguments and doubles every ^ in them,
+rem so a filename like "a ^ b.mp4" would no longer match the file on disk.
+for %%f in ("%CD%\*.mp4") do (
+    set "IN=%%~ff"
+    call :process
+)
 
 :summary
 echo.
@@ -211,8 +217,8 @@ rem ===================================================================
 rem  process one file
 rem ===================================================================
 :process
-set "IN=%~1"
-set "NAME=%~nx1"
+rem IN is set by the caller; derive NAME from it
+for %%I in ("%IN%") do set "NAME=%%~nxI"
 if exist "%OUTDIR%\%NAME%" (
     echo [SKIP] "%NAME%" ^(already in output dir^)
     set /a SKIPCNT+=1
@@ -299,6 +305,12 @@ rem When rotating, the cover must follow the video. -hwaccel qsv hw-decodes
 rem the cover (mjpeg/png) into QSV frames that CPU filters cannot consume, so
 rem the cover is taken from a second software-only input (DIN) and re-encoded
 rem as high-quality mjpeg - a filtered stream cannot be stream-copied.
+rem NOTE: the DIN line intentionally uses the UNQUOTED set form. The quoted
+rem form set "DIN=-i "%IN%"" nests quotes, leaving the expanded path in an
+rem unquoted region - a filename with ( ) or & then corrupts the block
+rem ("\file was unexpected at this time") or silently truncates DIN. With
+rem set DIN=-i "%IN%" the path sits inside one quoted region and parens,
+rem ampersands and spaces all survive. Verified by test.
 set "DIN="
 if "%KEEPCOVER%"=="1" (
     if "%ROT%"=="2" (
@@ -307,7 +319,7 @@ if "%KEEPCOVER%"=="1" (
     ) else (
         set "MAPS=-map 0:v:%MAINV% -map 1:v:%OTHERV%? -map 0:a:0?"
         set "COVER=-filter:v:1 %VFCPU% -c:v:1 mjpeg -q:v:1 2 -disposition:v:1 attached_pic"
-        set "DIN=-i "%IN%""
+        set DIN=-i "%IN%"
     )
 ) else (
     set "MAPS=-map 0:v:%MAINV% -map 0:a:0?"
