@@ -32,7 +32,7 @@ set "FP=D:/software/ffmpeg/bin/ffprobe.exe"
 rem ---------------- CONFIG ----------------
 rem Output directory. Kept separate from the source dir on purpose: any stray
 rem same-named file in the output dir would otherwise silently skip the video.
-set "OUTDIR=%USERPROFILE%\Desktop\H265"
+set "OUTDIR=%USERPROFILE%\Desktop\"
 rem Resolution cap. max()/min() makes it orientation independent: the LONG side
 rem is capped at MAXW and the SHORT side at MAXH, whichever way the source is.
 set "MAXW=1920"
@@ -157,9 +157,9 @@ if "%TOTAL%"=="0" (
     goto :summary
 )
 
-echo Source : %CD%\
-echo FFmpeg : %FF%
-echo Output : %OUTDIR%
+echo Source : "%CD%\"
+echo FFmpeg : "%FF%"
+echo Output : "%OUTDIR%"
 echo Rotate : %ROTTXT%
 echo Cap    : long side %MAXW% / short side %MAXH%, bitrate cap %BRCAP%k
 echo Audio  : auto max no-clip gain, ceiling %MAXGAIN% dB
@@ -280,7 +280,10 @@ if not "%MAXVOL:~0,1%"=="-" (
 set "GAIN=%MAXVOL:-=%"
 for /f "delims=." %%i in ("%GAIN%") do set "GI=%%i"
 if "%GI%"=="0" goto :haveaud
-if %GI% GTR %MAXGAIN% (
+rem GTR alone would miss GI == MAXGAIN with a fraction on top (a -24.7 dB
+rem peak with MAXGAIN=24); GEQ catches that. The second test spares an exact
+rem MAXGAIN.0 peak, which needs no capping.
+if %GI% GEQ %MAXGAIN% if not "%GAIN%"=="%MAXGAIN%.0" (
     set "GAIN=%MAXGAIN%"
     echo [WARN] "%NAME%" : peak %MAXVOL% dB needs more than %MAXGAIN% dB, gain capped
 )

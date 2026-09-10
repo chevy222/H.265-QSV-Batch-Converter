@@ -49,9 +49,9 @@ convert_h265.bat 2   REM 2 = 不旋转（仅缩放/转码）
 输出示例：
 
 ```text
-Source : D:\videos\
-FFmpeg : D:/software/ffmpeg/bin/ffmpeg.exe
-Output : C:\Users\you\Desktop\H265
+Source : "D:\videos\"
+FFmpeg : "D:/software/ffmpeg/bin/ffmpeg.exe"
+Output : "C:\Users\you\Desktop\"
 Rotate : clockwise 90
 Cap    : long side 1920 / short side 1080, bitrate cap 5000k
 Audio  : auto max no-clip gain, ceiling 24 dB
@@ -65,7 +65,7 @@ Cover  : 1 (1 = keep attached_pic, rotated with the video)
 All done. OK=1  FAIL=0  SKIP=0  (encoder mode 2)
 ```
 
-**输出位置**：`%USERPROFILE%\Desktop\H265`（可用 `OUTDIR` 改）。与源文件同名；已存在则 `[SKIP]`，可安全重复运行。
+**输出位置**：`%USERPROFILE%\Desktop\`（可用 `OUTDIR` 改）。与源文件同名；已存在则 `[SKIP]`，可安全重复运行。
 
 > 输出目录刻意与源目录分开。如果把输出直接放在桌面上，桌面上的任何同名文件都会让对应视频被静默跳过。
 
@@ -99,7 +99,7 @@ All done. OK=1  FAIL=0  SKIP=0  (encoder mode 2)
 ## 自定义（脚本顶部 CONFIG）
 
 ```bat
-set "OUTDIR=%USERPROFILE%\Desktop\H265"   REM 输出目录（不要和源目录相同）
+set "OUTDIR=%USERPROFILE%\Desktop\"   REM 输出目录（不要和源目录相同）
 set "MAXW=1920"                           REM 长边上限
 set "MAXH=1080"                           REM 短边上限
 set "BRCAP=5000"                          REM 视频码率封顶 kbps
