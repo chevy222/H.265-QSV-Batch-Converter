@@ -106,10 +106,10 @@ if not "%ERRORLEVEL%"=="0" (
 )
 
 rem --- refuse to run when the output dir is the source dir (would mass-SKIP)
-rem Normalised through pushd, deliberately NOT %%~f: CONFIG's OUTDIR ends in a
-rem backslash, %%~f preserves it, so "C:\x\Desktop\" could never equal %CD%'s
-rem "C:\x\Desktop" and this guard silently did nothing. Verified:
-rem   for %I in ("C:\x\Desktop\") do @echo [%~fI]   ->   [C:\x\Desktop\]
+rem Normalised through pushd, NOT through the FOR-tilde-f operator. Reason: that
+rem operator keeps a trailing backslash, and CONFIG's OUTDIR is written with one
+rem ("...Desktop\"), so comparing it against %CD% (which has no trailing slash)
+rem never matched and the guard silently did nothing.
 rem pushd canonicalises (drops trailing separators, resolves short names), so
 rem both sides compare equal. OUTDIR was created just above, so pushd cannot
 rem fail on a first run.
@@ -142,10 +142,13 @@ if not "%ROT%"=="1" if not "%ROT%"=="2" if not "%ROT%"=="0" (
 
 rem --- scale factor: long side <= MAXW, short side <= MAXH, never upscale.
 rem max()/min() keeps this correct for portrait AND landscape sources.
-rem WSC/HSC are the PRE-rotation dimensions. The two filter chains consume them
-rem in OPPOSITE orders, so VF1 and VFCPU are deliberately NOT the same string:
-rem   vpp_qsv (mode 1)   scales first, then transposes -> (WSC, HSC)
-rem   CPU     (mode 2/3) transposes first, then scales -> (HSC, WSC)
+rem WSC/HSC are EXPRESSIONS (they contain iw/ih), not baked-in numbers, so each
+rem chain must be read against the frame its scale step actually sees:
+rem   vpp_qsv (mode 1)   scales BEFORE transposing -> iw/ih = pre-rotation source
+rem   CPU     (mode 2/3) transposes BEFORE scaling -> iw/ih = already-rotated frame
+rem Both therefore want the SAME order, w=WSC / h=HSC. Do NOT swap the CPU one:
+rem iw/ih are re-evaluated inside the scale filter, so swapping does not move the
+rem rotation, it inverts the target size and squashes the rotated frame back.
 set "SC=min(1,min(%MAXW%/max(iw,ih),%MAXH%/min(iw,ih)))"
 set "WSC=floor(iw*%SC%/2)*2"
 set "HSC=floor(ih*%SC%/2)*2"
@@ -167,20 +170,15 @@ if "%ROT%"=="2" (
 ) else (
     set "VF1=vpp_qsv=transpose=%ROTQSV%:w='%WSC%':h='%HSC%'"
 )
-rem MODE 2 / 3 filters run on the CPU and TRANSPOSE FIRST, then scale - so they
-rem need the POST-rotation size (HSC/WSC). Sharing VF1's WSC/HSC here squashed
-rem every rotated frame back to its pre-rotation dimensions: a 480x640 source
-rem came out 480x640 instead of 640x480 (stretched 1.78x), and 2560x1440 came
-rem out 1920x1080 instead of 1080x1920 - the wrong orientation outright. The
-rem cover used this same string, so it also ended up rotated the opposite way
-rem from the video in mode 1. Verified frame-for-frame against mode 1: with
-rem HSC/WSC the CPU path is a byte-identical picture. MODE 2 additionally
-rem prepends hwdownload,format=nv12.
-if "%ROT%"=="2" (
-    set "VFCPU=scale='%WSC%':'%HSC%'"
-) else (
-    set "VFCPU=%ROTCPU%scale='%HSC%':'%WSC%'"
-)
+rem MODE 2 / 3 filters run on the CPU and TRANSPOSE FIRST, so when their scale
+rem step runs, iw/ih already describe the ROTATED frame - and because WSC/HSC are
+rem expressions, scale='%WSC%':'%HSC%' then yields the correctly oriented size by
+rem itself. Same order as VF1. (A past "optimisation" swapped these two sides
+rem for the rotated case; that does not rotate anything, it just re-squashes the
+rem frame: 480x640 came out 480x640 instead of 640x480, 2560x1440 came out
+rem 1920x1080 instead of 1080x1920. Reverted.) ROTCPU is empty for ROT=2, so one
+rem line covers every case. MODE 2 additionally prepends hwdownload,format=nv12.
+set "VFCPU=%ROTCPU%scale='%WSC%':'%HSC%'"
 
 rem --- nothing to do?
 set "TOTAL=0"
