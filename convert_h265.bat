@@ -6,6 +6,9 @@ rem   video bitrate = source bitrate, capped at BRCAP kbps
 rem   audio: auto gain to full scale, capped at MAXGAIN dB, no clipping
 rem   cover art (attached_pic) follows the video: rotated + scaled and
 rem   re-encoded as mjpeg when rotating, copied through untouched otherwise
+rem   the source's rotation display matrix is cleared on both inputs, so the
+rem   physical transpose is never applied a second time by the player
+rem   all audio tracks are kept (was: only a:0, silently dropping the rest)
 rem   rotation: arg/prompt 1 = counter-clockwise 90, 2 = none, default = clockwise 90
 rem
 rem Encoder path is negotiated once on the first file, then locked in:
@@ -95,18 +98,33 @@ set "FP=ffprobe"
 echo [INFO] hardcoded path missing, using ffmpeg/ffprobe from PATH
 :tools_ok
 
+if not exist "%OUTDIR%" md "%OUTDIR%"
+if not "%ERRORLEVEL%"=="0" (
+    echo [ERROR] cannot create output directory "%OUTDIR%"
+    if "%ASK%"=="1" pause
+    exit /b 1
+)
+
 rem --- refuse to run when the output dir is the source dir (would mass-SKIP)
-for %%d in ("%OUTDIR%") do set "OUTDIR_FULL=%%~fd"
+rem Normalised through pushd, deliberately NOT %%~f: CONFIG's OUTDIR ends in a
+rem backslash, %%~f preserves it, so "C:\x\Desktop\" could never equal %CD%'s
+rem "C:\x\Desktop" and this guard silently did nothing. Verified:
+rem   for %I in ("C:\x\Desktop\") do @echo [%~fI]   ->   [C:\x\Desktop\]
+rem pushd canonicalises (drops trailing separators, resolves short names), so
+rem both sides compare equal. OUTDIR was created just above, so pushd cannot
+rem fail on a first run.
+pushd "%OUTDIR%"
+if not "%ERRORLEVEL%"=="0" (
+    echo [ERROR] cannot enter output directory "%OUTDIR%"
+    if "%ASK%"=="1" pause
+    exit /b 1
+)
+set "OUTDIR_FULL=%CD%"
+popd
 if /i "%CD%"=="%OUTDIR_FULL%" (
     echo [ERROR] source directory and output directory are the same: "%CD%"
     echo         every file would be skipped as "already converted".
     echo         Change OUTDIR or run the script from another folder.
-    if "%ASK%"=="1" pause
-    exit /b 1
-)
-if not exist "%OUTDIR%" md "%OUTDIR%"
-if not "%ERRORLEVEL%"=="0" (
-    echo [ERROR] cannot create output directory "%OUTDIR%"
     if "%ASK%"=="1" pause
     exit /b 1
 )
@@ -123,9 +141,11 @@ if not "%ROT%"=="1" if not "%ROT%"=="2" if not "%ROT%"=="0" (
 )
 
 rem --- scale factor: long side <= MAXW, short side <= MAXH, never upscale.
-rem max()/min() keeps this correct for portrait AND landscape sources, for both
-rem the vpp_qsv path (scales first, then transposes) and the CPU path
-rem (transposes first, then scales).
+rem max()/min() keeps this correct for portrait AND landscape sources.
+rem WSC/HSC are the PRE-rotation dimensions. The two filter chains consume them
+rem in OPPOSITE orders, so VF1 and VFCPU are deliberately NOT the same string:
+rem   vpp_qsv (mode 1)   scales first, then transposes -> (WSC, HSC)
+rem   CPU     (mode 2/3) transposes first, then scales -> (HSC, WSC)
 set "SC=min(1,min(%MAXW%/max(iw,ih),%MAXH%/min(iw,ih)))"
 set "WSC=floor(iw*%SC%/2)*2"
 set "HSC=floor(ih*%SC%/2)*2"
@@ -140,14 +160,27 @@ if "%ROT%"=="2" set "ROTTXT=none"
 if "%ROT%"=="2" set "ROTQSV="
 if "%ROT%"=="2" set "ROTCPU="
 
-rem MODE 1 filters run on the GPU
+rem MODE 1 filters run on the GPU. vpp_qsv scales FIRST, then transposes, so it
+rem takes the PRE-rotation size (WSC/HSC) and the result comes out (HSC, WSC).
 if "%ROT%"=="2" (
     set "VF1=scale_qsv=w='%WSC%':h='%HSC%'"
 ) else (
     set "VF1=vpp_qsv=transpose=%ROTQSV%:w='%WSC%':h='%HSC%'"
 )
-rem MODE 2 / 3 filters run on the CPU (MODE 2 prepends hwdownload,format=nv12)
-set "VFCPU=%ROTCPU%scale='%WSC%':'%HSC%'"
+rem MODE 2 / 3 filters run on the CPU and TRANSPOSE FIRST, then scale - so they
+rem need the POST-rotation size (HSC/WSC). Sharing VF1's WSC/HSC here squashed
+rem every rotated frame back to its pre-rotation dimensions: a 480x640 source
+rem came out 480x640 instead of 640x480 (stretched 1.78x), and 2560x1440 came
+rem out 1920x1080 instead of 1080x1920 - the wrong orientation outright. The
+rem cover used this same string, so it also ended up rotated the opposite way
+rem from the video in mode 1. Verified frame-for-frame against mode 1: with
+rem HSC/WSC the CPU path is a byte-identical picture. MODE 2 additionally
+rem prepends hwdownload,format=nv12.
+if "%ROT%"=="2" (
+    set "VFCPU=scale='%WSC%':'%HSC%'"
+) else (
+    set "VFCPU=%ROTCPU%scale='%HSC%':'%WSC%'"
+)
 
 rem --- nothing to do?
 set "TOTAL=0"
@@ -176,7 +209,12 @@ for %%f in ("%CD%\*.mp4") do (
 :summary
 echo.
 echo ----------------------------------------
-if defined VMODE (set "MODEDISP=%VMODE%") else (set "MODEDISP=-")
+rem Assign outside any bracketed block: %VMODE% then expands on this very line,
+rem with VMODE already final. The old `if defined VMODE (set ...) else (...)` was
+rem correct only by accident - it worked because the summary runs after the loop,
+rem and would go silently stale if anything ever moved above it.
+set "MODEDISP=-"
+if defined VMODE set "MODEDISP=%VMODE%"
 echo All done. OK=%OKCNT%  FAIL=%FAILCNT%  SKIP=%SKIPCNT%  ^(encoder mode %MODEDISP%^)
 del "%BRFILE%" "%VOLFILE%" "%ABRFILE%" "%V0FILE%" 2>nul
 rem only hold the window open when running interactively (ASK=0 = unattended)
@@ -264,7 +302,11 @@ if /i "%V0C%"=="gif"   set "MAINV=1" & set "OTHERV=0"
 rem --- scan audio peak level, compute max no-clip gain (amplify to 0 dBFS)
 rem note: no -v error here on purpose, volumedetect prints at info level.
 rem findstr (not find) because Git Bash / Cygwin put their own find on PATH.
-set "AUD=-c:a:0 copy"
+rem -c:a WITHOUT the :0 stream specifier so every audio track survives. It used
+rem to be -c:a:0 paired with -map 0:a:0?, which silently dropped every track
+rem after the first. Caveat: the peak below is measured on the first track
+rem only, and the resulting gain/bitrate is then applied to all of them.
+set "AUD=-c:a copy"
 set "AUDTXT=copy"
 set "MAXVOL="
 set "GI=0"
@@ -297,13 +339,25 @@ if "%ABR%"=="N/A" set "ABR=128000"
 set /a ABK=%ABR%/1000
 if %ABK% LSS 64 set /a ABK=64
 if %ABK% GTR 192 set /a ABK=192
-set "AUD=-af volume=%GAIN%dB -c:a:0 aac -b:a %ABK%k"
+set "AUD=-af volume=%GAIN%dB -c:a aac -b:a %ABK%k"
 set "AUDTXT=+%GAIN%dB @ %ABK%k"
 :haveaud
 echo [CONV] "%NAME%" : bitrate %KB%k ^(peak %MAXKB%k^), rotate %ROTTXT%, audio %AUDTXT%
 
 set "LPOPT="
 if "%LOWPOWER%"=="1" set "LPOPT=-low_power 1"
+
+rem Clear the source's rotation display matrix, on BOTH inputs. -noautorotate
+rem only stops ffmpeg inserting its own transpose; ffmpeg still COPIES the
+rem input's display matrix onto the output stream. A phone clip tagged
+rem rotate=90 therefore came out physically rotated by our own transpose AND
+rem still tagged rotation=90, so a compliant player rotated it a second time
+rem (180 degrees total). -display_rotation 0 is an INPUT option (ffmpeg >= 6)
+rem and clears it. Verified on both the CPU and the QSV encoder paths: a source
+rem with rotation=90 produced an output with no rotation side data at all,
+rem while a source without the tag was unaffected (control).
+set "DROT=-display_rotation 0"
+
 rem When rotating, the cover must follow the video. -hwaccel qsv hw-decodes
 rem the cover (mjpeg/png) into QSV frames that CPU filters cannot consume, so
 rem the cover is taken from a second software-only input (DIN) and re-encoded
@@ -314,18 +368,20 @@ rem unquoted region - a filename with ( ) or & then corrupts the block
 rem ("\file was unexpected at this time") or silently truncates DIN. With
 rem set DIN=-i "%IN%" the path sits inside one quoted region and parens,
 rem ampersands and spaces all survive. Verified by test.
+rem %DROT% is prepended so the second input is cleared too - it is a plain
+rem token pair in front of -i, so it does not disturb the quoting above.
 set "DIN="
 if "%KEEPCOVER%"=="1" (
     if "%ROT%"=="2" (
-        set "MAPS=-map 0:v:%MAINV% -map 0:v:%OTHERV%? -map 0:a:0?"
+        set "MAPS=-map 0:v:%MAINV% -map 0:v:%OTHERV%? -map 0:a?"
         set "COVER=-c:v:1 copy -disposition:v:1 attached_pic"
     ) else (
-        set "MAPS=-map 0:v:%MAINV% -map 1:v:%OTHERV%? -map 0:a:0?"
+        set "MAPS=-map 0:v:%MAINV% -map 1:v:%OTHERV%? -map 0:a?"
         set "COVER=-filter:v:1 %VFCPU% -c:v:1 mjpeg -q:v:1 2 -disposition:v:1 attached_pic"
-        set DIN=-i "%IN%"
+        set DIN=%DROT% -i "%IN%"
     )
 ) else (
-    set "MAPS=-map 0:v:%MAINV% -map 0:a:0?"
+    set "MAPS=-map 0:v:%MAINV% -map 0:a?"
     set "COVER="
 )
 
@@ -361,11 +417,11 @@ goto :eof
 
 rem ===================================================================
 rem  enc1 / enc2 / enc3 - one ffmpeg call each, exit code left in ERRORLEVEL
-rem  %MAPS% %COVER% %DIN% %LPOPT% must already be set (done in :process)
+rem  %MAPS% %COVER% %DIN% %DROT% %LPOPT% must already be set (done in :process)
 rem ===================================================================
 :enc1
 rem full GPU: qsv decode -> vpp_qsv / scale_qsv -> hevc_qsv
-"%FF%" -v error -stats -nostdin -y -noautorotate -hwaccel qsv -hwaccel_output_format qsv -i "%IN%" %DIN% ^
+"%FF%" -v error -stats -nostdin -y -noautorotate %DROT% -hwaccel qsv -hwaccel_output_format qsv -i "%IN%" %DIN% ^
     %MAPS% -filter:v:0 "%VF1%" ^
     -c:v:0 hevc_qsv %LPOPT% -preset veryfast -extbrc 1 ^
     -b:v %KB%k -maxrate %MAXKB%k -bufsize %BUFKB%k -tag:v:0 hvc1 ^
@@ -376,7 +432,7 @@ exit /b
 rem hybrid: qsv decode -> hwdownload -> CPU filter -> hevc_qsv
 rem -hwaccel qsv hands QSV frames to the filter graph even without
 rem -hwaccel_output_format qsv, so hwdownload is mandatory before CPU filters.
-"%FF%" -v error -stats -nostdin -y -noautorotate -hwaccel qsv -i "%IN%" %DIN% ^
+"%FF%" -v error -stats -nostdin -y -noautorotate %DROT% -hwaccel qsv -i "%IN%" %DIN% ^
     %MAPS% -filter:v:0 "hwdownload,format=nv12,%VFCPU%" ^
     -c:v:0 hevc_qsv -preset veryfast -extbrc 1 ^
     -b:v %KB%k -maxrate %MAXKB%k -bufsize %BUFKB%k -tag:v:0 hvc1 ^
@@ -385,7 +441,7 @@ exit /b
 
 :enc3
 rem software fallback: CPU decode -> CPU filter -> libx265
-"%FF%" -v error -stats -nostdin -y -noautorotate -i "%IN%" %DIN% ^
+"%FF%" -v error -stats -nostdin -y -noautorotate %DROT% -i "%IN%" %DIN% ^
     %MAPS% -filter:v:0 "%VFCPU%" ^
     -c:v:0 libx265 -crf %CRF% -preset medium -tag:v:0 hvc1 ^
     %COVER% %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
