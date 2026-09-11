@@ -53,8 +53,11 @@ rem -low_power 1 for the full-GPU path. Some older Intel drivers reject it with
 rem "some encoding parameters are not supported by the QSV runtime"; set to 0 then.
 set "LOWPOWER=1"
 rem 1 = ask for the rotation mode when no argument is given.
-rem set /p blocks forever on a non-interactive stdin (scheduled task, pipe, some
-rem CI runners). Set ASK=0 - or always pass the mode as %1 - in those cases.
+rem set /p returns IMMEDIATELY on an EOF/NUL stdin and just leaves ROT unset (the
+rem fallback below turns that into clockwise 90). What it cannot survive is a
+rem pipe that stays open without ever delivering a line, or a console-less
+rem scheduled task - there it waits forever. Set ASK=0 - or always pass the mode
+rem as %1 - in those cases.
 set "ASK=1"
 rem 1 = keep the source cover art as attached_pic
 set "KEEPCOVER=1"
@@ -67,12 +70,19 @@ if defined FORCE_MODE if not "%FORCE_MODE%"=="1" if not "%FORCE_MODE%"=="2" if n
 )
 rem ----------------------------------------
 
-rem unique suffix so two instances running at once do not clobber each other
-set "RND=%RANDOM%"
-set "BRFILE=%TEMP%\h265_br_%RND%.txt"
-set "VOLFILE=%TEMP%\h265_vol_%RND%.txt"
-set "ABRFILE=%TEMP%\h265_abr_%RND%.txt"
-set "V0FILE=%TEMP%\h265_v0_%RND%.txt"
+rem Scratch files live in a private per-instance directory, claimed with mkdir
+rem further down (right before the processing loop, so no early exit can leak it).
+rem Do NOT name them with %RANDOM%: cmd seeds its PRNG per SECOND, so two
+rem instances started in the same second emit the IDENTICAL sequence and would
+rem share - and then delete - each other's probe files. Measured on this box:
+rem four cmd processes launched in the same second all printed
+rem "12264 15960 26751 22810". mkdir is the only unique-name primitive plain cmd
+rem has (a directory that already exists makes it fail).
+set "TMPD="
+set "BRFILE="
+set "VOLFILE="
+set "ABRFILE="
+set "V0FILE="
 set "OKCNT=0"
 set "FAILCNT=0"
 set "SKIPCNT=0"
@@ -188,6 +198,24 @@ if "%TOTAL%"=="0" (
     goto :summary
 )
 
+rem --- claim a private scratch dir under %TEMP%. mkdir fails when the directory
+rem already exists, which is the whole lock. Claimed only now, i.e. after every
+rem path that can `exit /b 1`, so nothing can leak the directory; and only when
+rem there is actually work to do, so an empty folder leaves %TEMP% untouched.
+rem The probe files are derived from it here rather than in CONFIG because TMPD
+rem is still empty up there.
+set "SLOT=0"
+:claim_slot
+set /a SLOT+=1
+if %SLOT% GTR 500 goto :no_slot
+mkdir "%TEMP%\h265_%SLOT%" 2>nul
+if not "%ERRORLEVEL%"=="0" goto :claim_slot
+set "TMPD=%TEMP%\h265_%SLOT%"
+set "BRFILE=%TMPD%\br.txt"
+set "VOLFILE=%TMPD%\vol.txt"
+set "ABRFILE=%TMPD%\abr.txt"
+set "V0FILE=%TMPD%\v0.txt"
+
 echo Source : "%CD%\"
 echo FFmpeg : "%FF%"
 echo Output : "%OUTDIR%"
@@ -215,6 +243,13 @@ set "MODEDISP=-"
 if defined VMODE set "MODEDISP=%VMODE%"
 echo All done. OK=%OKCNT%  FAIL=%FAILCNT%  SKIP=%SKIPCNT%  ^(encoder mode %MODEDISP%^)
 del "%BRFILE%" "%VOLFILE%" "%ABRFILE%" "%V0FILE%" 2>nul
+rem Then release the scratch dir. rd WITHOUT /s on purpose: it only removes an
+rem EMPTY directory, so it fails if one of the dels above did not take - that is
+rem a free "cleanup really succeeded" check, and it can never recurse into
+rem anything. The path is one we created ourselves and nothing but our own four
+rem probe files ever lands in it. A leftover dir costs a few bytes and the next
+rem run simply claims the following slot.
+if defined TMPD rd "%TMPD%" 2>nul
 rem only hold the window open when running interactively (ASK=0 = unattended)
 if "%ASK%"=="1" pause
 exit /b 0
@@ -386,6 +421,12 @@ if "%KEEPCOVER%"=="1" (
 rem :probe already encodes the first file with the winning encN, so only
 rem dispatch when a mode is already locked. Nothing inside the parens reads
 rem ERRORLEVEL, per the trap note at the top of this file.
+rem CAVEAT: %VMODE% IS read inside a bracketed block below, so it is expanded
+rem when this whole if/else is parsed. That is safe only because :probe sets
+rem VMODE at RUN time and this statement gets parsed again on the next
+rem `call :process` - i.e. it is correct from file 2 onwards. Anything that
+rem turns the per-file `call` into one long-parsed block would silently make
+rem every file re-negotiate the encoder path (or take the else branch forever).
 if defined VMODE (
     if "%VMODE%"=="1" call :enc1
     if "%VMODE%"=="2" call :enc2
@@ -444,3 +485,14 @@ rem software fallback: CPU decode -> CPU filter -> libx265
     -c:v:0 libx265 -crf %CRF% -preset medium -tag:v:0 hvc1 ^
     %COVER% %AUD% -movflags +faststart "%OUTDIR%\%NAME%"
 exit /b
+
+rem ===================================================================
+rem  scratch-dir claim failed (see :claim_slot above). Only reachable via
+rem  goto. 500 slots occupied means either a lot of leaked leftovers or a
+rem  %TEMP% we cannot write to - either way, stopping beats two instances
+rem  quietly sharing one scratch dir.
+rem ===================================================================
+:no_slot
+echo [ERROR] cannot claim a scratch directory under "%TEMP%" ^(500 slots tried^)
+if "%ASK%"=="1" pause
+exit /b 1
